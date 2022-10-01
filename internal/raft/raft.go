@@ -21,6 +21,7 @@ var (
 	ErrInvalidNodeId    = errors.New("InvalidNodeIdError")
 	ErrInvalidNodeAddr  = errors.New("InvalidNodeAddrError")
 	ErrInvalidNodeIndex = errors.New("InvalidNodeIndexError")
+	ErrInvalidTCPIP     = errors.New("InvalidTCPIPError")
 )
 
 const (
@@ -52,54 +53,71 @@ const (
 
 type Logs []Log
 
-func (l Logs) getLog(index uint64) (Log, bool) {
-	if uint64(len(l)-1) > index {
+func (l Logs) checkBoundary(index uint64) bool {
+	return index <= uint64(len(l)-1)
+}
+
+func (l *State) getLog(index uint64) (Log, bool) {
+	if !l.logs.checkBoundary(index) {
 		return Log{}, false
 	}
 
-	return l[index], true
+	return l.logs[index], true
 }
 
-func (l Logs) getLatest() Log {
-	return l[len(l)-1]
+func (l *State) getLatest() (Log, bool) {
+	if len(l.logs) == 0 {
+		return Log{}, false
+	}
+	return l.logs[len(l.logs)-1], true
 }
 
-func (l Logs) getSendableLogs(index uint64) []Log {
+func (l *State) getLatestIndex() uint64 {
+	if len(l.logs) == 0 {
+		return 0
+	}
 
-	if index == 0 {
+	return uint64(len(l.logs) - 1)
+}
+
+func (l *State) getSendableLogs(nextIndex uint64) []Log {
+	if len(l.logs) == 0 {
 		return nil
 	}
 
-	if uint64(len(l)-1) > index {
+	if !l.logs.checkBoundary(nextIndex) {
 		return nil
 	}
 
-	return l[index:]
+	return l.logs[nextIndex:]
 }
 
-func (l Logs) deleteLogs(index uint64) {
-	if uint64(len(l)-1) > index {
+func (l *State) deleteLogs(index uint64) {
+	if !l.logs.checkBoundary(index) {
 		return
 	}
 
-	l = l[:index]
+	l.logs = l.logs[:index]
+}
+
+func (l *State) getLogTerm(index uint64) uint64 {
+	if len(l.logs) == 0 {
+		return 0
+	}
+
+	if !l.logs.checkBoundary(index) {
+		return 0
+	}
+
+	return l.logs[index].Term
 }
 
 func (r *Raft) deleteLogs(index uint64) {
-	r.state.logs.deleteLogs(index)
+	r.state.deleteLogs(index)
 }
 
 func (r *Raft) getLogTerm(index uint64) uint64 {
-	if len(r.state.logs) == 0 {
-		return 0
-	}
-
-	if uint64(len(r.state.logs)-1) > index {
-		return 0
-	}
-
-	return r.state.logs[index].Term
-
+	return r.state.getLogTerm(index)
 }
 
 type State struct {
@@ -118,6 +136,7 @@ type State struct {
 
 }
 
+//TODO TransportManagerとして分割
 type Transport struct {
 	net.Listener
 }
@@ -167,6 +186,7 @@ func NewRaftMessage(addr string, payload Payload) *RaftMessage {
 	}
 }
 
+//TODO 後々VoteManagerとして分割
 type VotedInfo struct {
 	m  map[Node]bool
 	mu sync.Mutex
@@ -214,7 +234,12 @@ func (v *VotedInfo) getCurrentVote() uint64 {
 	return uint64(voted)
 }
 
-//とりあえずリーダー選挙から実装していく
+var defaultCreateElectionTime = func() time.Duration {
+	num := rand.Intn(MaxElectionTime-MinElectionTime) + MinElectionTime
+	return time.Duration(num)
+}
+
+//pingInterval<=とすること
 type Raft struct {
 	// appendCh     chan api.AppendEntriesRequest
 	requestCh chan *RaftMessage
@@ -232,16 +257,17 @@ type Raft struct {
 
 	nodes []Node //自分を含める
 
-	pingInterval     time.Duration
-	tickers          []*time.Ticker
-	heartbeatTimeout time.Duration
+	pingInterval    time.Duration
+	tickers         []*time.Ticker
+	electionTimeout time.Duration
 
-	state         State
+	state         *State
 	currentStatus Status
 	addr          string
 
-	votedInfo *VotedInfo
-	fsm       FSM
+	votedInfo            *VotedInfo
+	fsm                  FSM
+	generateElectionTime func() time.Duration
 }
 
 func (r *Raft) isFollower() bool {
@@ -294,12 +320,16 @@ func (r *Raft) receive(conn net.Conn) ([]byte, error) {
 }
 
 type Config struct {
-	serverAddr string //include port
-	msgTimeout time.Duration
-	logger     *log.Logger
-	peerAddrs  []string
-	fsm        FSM
+	serverAddr             string //include port
+	msgTimeout             time.Duration
+	pingInterval           time.Duration
+	logger                 *log.Logger
+	peerAddrs              []string
+	fsm                    FSM
+	generateElectionTimeFn func() time.Duration
 }
+
+//TODO のちのちNodeManagerとして分割
 
 func makeNodes(c *Config) []Node {
 	nodeLen := len(c.peerAddrs) + 1
@@ -369,23 +399,43 @@ func NewRaft(c *Config) (*Raft, error) {
 	nextIndexes, matchIndexes := initMaps(nodes)
 	voteInfo := NewVotedInfo(nodes)
 
-	state := State{
+	state := &State{
 		nextIndexes:  nextIndexes,
 		matchIndexes: matchIndexes,
+	}
+
+	if c.logger == nil {
+		c.logger = log.Default()
+	}
+
+	if c.generateElectionTimeFn == nil {
+		c.generateElectionTimeFn = defaultCreateElectionTime
+	}
+
+	if c.msgTimeout == 0 {
+		c.msgTimeout = 10 * time.Second
+	}
+	if c.pingInterval == 0 {
+		c.pingInterval = 100 * time.Millisecond
 	}
 
 	r := &Raft{
 		Transport:      transport,
 		msgTimeout:     c.msgTimeout,
+		pingInterval:   c.pingInterval,
 		logger:         c.logger,
 		streamCh:       make(chan net.Conn),
+		requestCh:      make(chan *RaftMessage),
 		messageManager: mm,
-		addr:           c.serverAddr,
+
+		addr: c.serverAddr,
 
 		state: state,
 
-		fsm:       c.fsm,
-		votedInfo: voteInfo,
+		fsm:                  c.fsm,
+		votedInfo:            voteInfo,
+		nodes:                nodes,
+		generateElectionTime: c.generateElectionTimeFn,
 	}
 
 	//最初はFollwerから起動する
@@ -426,15 +476,14 @@ func (r *Raft) runState() {
 	}
 }
 
-//TODO prevLogとprevLogTerm,の扱い
+//TODO prevLogとprevLogTerm,の扱い,ここもやる
 func (r *Raft) HeartBeat() {
-
-	dummy := uint64(10)
-
+	// the prevLogIndex/Term should refer to the log entry immediately preceding the first element of the entries[] field of the RPC arguments in the leader’s log.
+	//とのことなので、HeartBeatのときprev~は0でいい？
 	payload := r.messageManager.CreateAppendEntriesRequest(
 		r.state.currentTerm,
-		dummy,
-		dummy,
+		0,
+		0,
 		r.state.commitIndex,
 		nil,
 		r.addr,
@@ -445,11 +494,13 @@ func (r *Raft) HeartBeat() {
 		return
 	}
 
-	msg, err := r.messageManager.Create(APPEND_ENTRIES, bytes)
+	msg, err := r.messageManager.Create(APPEND_ENTRIES, r.addr, bytes)
 	if err != nil {
 		r.logger.Println(err)
 		return
 	}
+
+	r.logger.Printf("%s send HeartBeat...\n", r.addr)
 
 	r.sendToAllFollower(msg)
 
@@ -483,7 +534,7 @@ func (r *Raft) deschedule() {
 }
 
 func (r *Raft) applyFSM(index uint64) {
-	log, exists := r.state.logs.getLog(index)
+	log, exists := r.state.getLog(index)
 	if !exists {
 		return
 	}
@@ -507,14 +558,12 @@ func (r *Raft) goToNextTerm(term uint64) {
 	r.state.votedFor = -1
 	r.votedInfo.reset()
 }
-func (r *Raft) commonProcessMessageOnAllStatus(term uint64) (shouldBeFollower bool) {
+func (r *Raft) commonProcessMessageOnAllStatus(term uint64) {
 	if r.state.currentTerm < term {
 		r.goToNextTerm(term)
 		r.changeCurrentStatus(Follower)
-		return true
+		return
 	}
-
-	return false
 }
 
 func (r *Raft) calculateNextIndex() uint64 {
@@ -533,7 +582,7 @@ func (r *Raft) getPrevIndexAndTerm(nextIndex uint64) (uint64, uint64) {
 	}
 
 	prevIndex := nextIndex - 1
-	prevLog, exists := r.state.logs.getLog(prevIndex)
+	prevLog, exists := r.state.getLog(prevIndex)
 	if !exists {
 		return 0, 0
 	}
@@ -569,8 +618,8 @@ func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEnt
 		//そのときはindex5~10をentriesとして送っている
 		//なので次に送る予定の11(まだリーダーのログにはないかも)をnextIndex
 		//matchIndexは対象のfollowerに複製済みの最大indexなので、今回複製した最大の10が入る...でいいはず
-		r.state.nextIndexes[node] = uint64(len(r.state.logs) + 1)
-		r.state.matchIndexes[node] = uint64(len(r.state.logs))
+		r.state.nextIndexes[node] = uint64(len(r.state.logs))
+		r.state.matchIndexes[node] = uint64(len(r.state.logs) - 1)
 		return
 	}
 
@@ -585,7 +634,7 @@ func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEnt
 	nextIndex := r.state.nextIndexes[node]
 	prevIndex, prevTerm := r.getPrevIndexAndTerm(nextIndex)
 
-	entries := r.state.logs.getSendableLogs(nextIndex)
+	entries := r.state.getSendableLogs(nextIndex)
 
 	aePayload := r.messageManager.CreateAppendEntriesRequest(
 		r.state.currentTerm,
@@ -601,7 +650,7 @@ func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEnt
 		return
 	}
 
-	msg, err := r.messageManager.Create(APPEND_ENTRIES, bytes)
+	msg, err := r.messageManager.Create(APPEND_ENTRIES, r.addr, bytes)
 	if err != nil {
 		r.logger.Println(err)
 		return
@@ -609,7 +658,6 @@ func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEnt
 
 	r.send(addr, msg)
 
-	return
 }
 
 func (r *Raft) handleLeaderClientMessage(payload *ClientMessage) {
@@ -671,7 +719,7 @@ func (r *Raft) checkIndexMatch(targetIndex uint64) bool {
 }
 
 func (r *Raft) checkLogTerm(targetIndex uint64) bool {
-	targetLog, exists := r.state.logs.getLog(targetIndex)
+	targetLog, exists := r.state.getLog(targetIndex)
 	if !exists {
 		return false
 	}
@@ -721,6 +769,8 @@ func (r *Raft) checkLastApplied() {
 }
 
 func (r *Raft) runLeader() {
+
+	r.logger.Printf("%s Go To Leader\n", r.addr)
 
 	r.resetStateOnLeader()
 
@@ -781,7 +831,7 @@ func (r *Raft) handleFollowerAppendEntries(addr string, payload *AppendEntriesRe
 			return false
 		}
 		//ここで存在しないことを確認しているのでPrevLogIndexに-1がきてもOKだけど事前に-1のチェックをしてもいい
-		log, exists := r.state.logs.getLog(payload.PrevLogIndex)
+		log, exists := r.state.getLog(payload.PrevLogIndex)
 
 		if !exists {
 			return false
@@ -876,7 +926,11 @@ func (r *Raft) handleFollowerMessage(message *RaftMessage) {
 
 //使いまわすんだったら新しい状態に入るときにchを新しく作り直して、状態が終わるときにchにnilを入れるとか？
 func (r *Raft) runFollower() {
-	t := time.NewTimer(r.heartbeatTimeout)
+	r.logger.Printf("%s Go To Follower\n", r.addr)
+
+	// t := time.NewTimer(r.electionTimeout)
+	electionTime := r.generateElectionTime()
+	t := time.NewTimer(electionTime)
 	for {
 
 		select {
@@ -891,7 +945,7 @@ func (r *Raft) runFollower() {
 		case message := <-r.requestCh:
 			r.handleFollowerMessage(message)
 			//timerReset
-			timerReset(t, r.heartbeatTimeout)
+			timerReset(t, electionTime)
 		case <-t.C:
 			//状態とかいじる系はlock掛けた方がいい？あとで検討
 			//選挙開始、term+1する
@@ -902,18 +956,35 @@ func (r *Raft) runFollower() {
 }
 
 func (r *Raft) sendRequestVote() {
-	payload := r.messageManager.CreateRequestVoteRequest()
+	meNode, err := r.getNodeByAddr(r.addr)
+	if err != nil {
+		r.logger.Println(err)
+		return
+	}
+
+	lastLogIndex := r.state.getLatestIndex()
+
+	lastLogTerm := r.state.getLogTerm(uint64(lastLogIndex))
+
+	payload := r.messageManager.CreateRequestVoteRequest(
+		r.state.currentTerm,
+		uint64(meNode.ServerId),
+		uint64(lastLogIndex),
+		lastLogTerm,
+	)
 	bytes, err := payload.Marshal()
 	if err != nil {
 		r.logger.Println(err)
 		return
 	}
 
-	msg, err := r.messageManager.Create(REQUEST_VOTE, bytes)
+	msg, err := r.messageManager.Create(REQUEST_VOTE, r.addr, bytes)
 	if err != nil {
 		r.logger.Println(err)
 		return
 	}
+
+	r.logger.Printf("%s send RequestVote\n", r.addr)
 
 	r.sendToAllFollower(msg)
 }
@@ -950,7 +1021,12 @@ func (r *Raft) checkVoteGranted(payload *RequestVoteRequest) bool {
 	// end with the same term, then whichever log is longer is
 	// more up-to-date.
 	isLogLatest := func() bool {
-		myLatestIndex, myLatestTerm := len(r.state.logs), r.state.logs.getLatest().Term
+		//自分の側にログがなくて相手の側にログあるときは相手の方が最新でいいはず
+		latestLog, logExists := r.state.getLatest()
+		if !logExists {
+			return true
+		}
+		myLatestIndex, myLatestTerm := len(r.state.logs), latestLog.Term
 
 		if myLatestTerm != payload.LastLogterm {
 			return myLatestTerm < payload.LastLogterm
@@ -978,8 +1054,15 @@ func (r *Raft) handleRaftRequestVote(addr string, payload *RequestVoteRequest) {
 		return
 	}
 
+	msg, err := r.messageManager.Create(REQUEST_VOTE_RESPONSE, r.addr, bytes)
+	if err != nil {
+		r.logger.Println(err)
+		return
+	}
+
 	//候補者へ返信
-	r.send(addr, bytes)
+	r.logger.Printf("%s get RequestVoteRequest: from: %s\n", r.addr, addr)
+	r.send(addr, msg)
 }
 
 //☆　過半数獲得でリーダー
@@ -990,8 +1073,8 @@ func (r *Raft) shouldLeader() bool {
 }
 
 func (r *Raft) createElectionTimer() *time.Timer {
-	num := rand.Intn(MaxElectionTime-MinElectionTime) + MinElectionTime
-	return time.NewTimer(time.Duration(num) * time.Millisecond)
+
+	return time.NewTimer(r.generateElectionTime() * time.Millisecond)
 }
 
 func (r *Raft) changeCurrentStatus(status Status) {
@@ -999,11 +1082,13 @@ func (r *Raft) changeCurrentStatus(status Status) {
 }
 
 func (r *Raft) startNewElection() {
+	r.logger.Printf("%s start NewElection\n", r.addr)
 	r.goToNextTerm(r.state.currentTerm + 1)
 	r.changeCurrentStatus(Candidate)
 }
 
 func (r *Raft) handleRaftRequestVoteResponse(addr string, payload *RequestVoteResponse) {
+	r.logger.Printf("%s get RequestVoteResponse: from: %s\n", r.addr, addr)
 	node, err := r.getNodeByAddr(addr)
 	if err != nil {
 		r.logger.Println(err)
@@ -1014,29 +1099,34 @@ func (r *Raft) handleRaftRequestVoteResponse(addr string, payload *RequestVoteRe
 	}
 }
 
-func (r *Raft) handleCandidateMessage(message *RaftMessage) bool {
+func (r *Raft) handleCandidateMessage(message *RaftMessage) {
 
 	switch payload := message.payload.(type) {
 	case *AppendEntriesRequest:
+		r.commonProcessMessageOnAllStatus(payload.Term)
 		r.handleCandidateAppendEntries(payload)
-		return r.commonProcessMessageOnAllStatus(payload.Term)
+		return
 	case *RequestVoteRequest:
+		r.commonProcessMessageOnAllStatus(payload.Term)
 		r.handleRaftRequestVote(message.addr, payload)
-		return r.commonProcessMessageOnAllStatus(payload.Term)
+		return
 	case *AppendEntriesResponse:
 		r.logger.Println(ErrInvalidMessage)
-		return false
+		return
 	case *RequestVoteResponse:
+		r.commonProcessMessageOnAllStatus(payload.Term)
 		r.handleRaftRequestVoteResponse(message.addr, payload)
-		return r.commonProcessMessageOnAllStatus(payload.Term)
+		return
 	default:
 		r.logger.Println(ErrUnknownMessage)
-		return false
+		return
 	}
 
 }
 
 func (r *Raft) runCandidate() {
+
+	r.logger.Printf("%s Go To Candidate\n", r.addr)
 
 	t := r.createElectionTimer()
 	//自分自身に投票
@@ -1118,20 +1208,10 @@ func (r *Raft) MessageHandler() {
 	}
 }
 
-//きたパケットの処理(ReadFullかCopy、Copyの方がパイプ使ってるからよさげ？)はmemberlistを参考に.messageのport部分はnet.addrをconn.RemoteAddr()からとってこれるので要らないっぽい？
 func (r *Raft) handleMessage(conn net.Conn) {
 	defer conn.Close()
 
 	bufConn := bufio.NewReader(conn)
-
-	//messageTypeを見る
-	messagebuf := [1]byte{0}
-	if _, err := io.ReadFull(bufConn, messagebuf[:]); err != nil {
-		r.logger.Println(err)
-		return
-	}
-
-	msgType := MessageType(messagebuf[0])
 
 	var buf bytes.Buffer
 	if _, err := io.Copy(&buf, bufConn); err != nil {
@@ -1139,20 +1219,24 @@ func (r *Raft) handleMessage(conn net.Conn) {
 		return
 	}
 
-	payload, addr := buf.Bytes(), conn.RemoteAddr().String()
+	msg, err := r.messageManager.Parse(buf.Bytes())
+	if err != nil {
+		r.logger.Println(err)
+		return
+	}
 
-	switch msgType {
+	switch msg.MessageType {
 	case APPEND_ENTRIES:
-		r.handleAppendEntries(payload, addr)
+		r.handleAppendEntries(msg.Payload, msg.Addr)
 		return
 	case REQUEST_VOTE:
-		r.handleRequestVote(payload, addr)
+		r.handleRequestVote(msg.Payload, msg.Addr)
 		return
 	case APPEND_ENTRIES_RESPONSE:
-		r.handleAppendEntriesResponse(payload, addr)
+		r.handleAppendEntriesResponse(msg.Payload, msg.Addr)
 		return
 	case REQUEST_VOTE_RESPONSE:
-		r.handleRequestVoteResponse(payload, addr)
+		r.handleRequestVoteResponse(msg.Payload, msg.Addr)
 		return
 	default:
 		r.logger.Println(ErrUnknownMessage)
@@ -1210,5 +1294,4 @@ func (r *Raft) ShutDown() {
 	if err != nil {
 		r.logger.Println(err)
 	}
-	r.deschedule()
 }

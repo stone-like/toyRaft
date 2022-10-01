@@ -11,14 +11,16 @@ func TestMessageManagerCreateAndParse(t *testing.T) {
 
 	payload := []byte("hello world")
 	messageType := APPEND_ENTRIES
+	addr := "192.0.0.0.1"
 
-	content, err := mm.Create(messageType, payload)
+	content, err := mm.Create(messageType, addr, payload)
 	require.NoError(t, err)
 
-	gotType, gotPayload, err := mm.Parse(content)
+	msg, err := mm.Parse(content)
 	require.NoError(t, err)
 
-	require.Equal(t, messageType, gotType)
-	require.Equal(t, payload, gotPayload)
+	require.Equal(t, messageType, msg.MessageType)
+	require.Equal(t, addr, msg.Addr)
+	require.Equal(t, payload, msg.Payload)
 
 }

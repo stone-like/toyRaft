@@ -22,14 +22,18 @@ func TestMessageMarshalAndUnmarshal(t *testing.T) {
 	require.NoError(t, err)
 
 	messageType := APPEND_ENTRIES
+	addr := "192.0.0.1"
 
-	content, err := mm.Create(messageType, payload)
+	content, err := mm.Create(messageType, addr, payload)
 	require.NoError(t, err)
 
-	gotType, gotPayload, err := mm.Parse(content)
+	msg, err := mm.Parse(content)
 	require.NoError(t, err)
+
+	gotType, gotAddress, gotPayload := msg.MessageType, msg.Addr, msg.Payload
 
 	require.Equal(t, messageType, gotType)
+	require.Equal(t, addr, gotAddress)
 
 	gotMessage1 := &AppendEntriesRequest{}
 	err = gotMessage1.Unmarshal(gotPayload)
@@ -51,11 +55,16 @@ func TestMessageMarshalAndUnmarshal(t *testing.T) {
 
 	messageType = REQUEST_VOTE
 
-	content, err = mm.Create(messageType, payload)
+	content, err = mm.Create(messageType, addr, payload)
 	require.NoError(t, err)
 
-	gotType, gotPayload, err = mm.Parse(content)
+	msg, err = mm.Parse(content)
 	require.NoError(t, err)
+
+	gotType, gotAddress, gotPayload = msg.MessageType, msg.Addr, msg.Payload
+
+	require.Equal(t, messageType, gotType)
+	require.Equal(t, addr, gotAddress)
 
 	require.Equal(t, messageType, gotType)
 

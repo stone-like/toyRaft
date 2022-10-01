@@ -13,6 +13,7 @@ const (
 
 type Message struct {
 	MessageType MessageType
+	Addr        string
 	Payload     []byte
 }
 
@@ -22,9 +23,10 @@ func NewMassageManager() *MessageManager {
 	return &MessageManager{}
 }
 
-func (mm *MessageManager) Create(messageType MessageType, payload []byte) ([]byte, error) {
+func (mm *MessageManager) Create(messageType MessageType, addr string, payload []byte) ([]byte, error) {
 	m := &Message{
 		MessageType: messageType,
+		Addr:        addr,
 		Payload:     payload,
 	}
 
@@ -32,13 +34,13 @@ func (mm *MessageManager) Create(messageType MessageType, payload []byte) ([]byt
 
 }
 
-func (mm *MessageManager) Parse(content []byte) (MessageType, []byte, error) {
+func (mm *MessageManager) Parse(content []byte) (Message, error) {
 	var msg Message
 	if err := json.Unmarshal(content, &msg); err != nil {
-		return 0, nil, err
+		return Message{}, err
 	}
 
-	return msg.MessageType, msg.Payload, nil
+	return msg, nil
 }
 
 func (mm *MessageManager) CreateAppendEntriesRequest(term, prevLogIndex, prevLogTerm, leaderCommit uint64, entries []Log, leaderId string) *AppendEntriesRequest {
@@ -52,8 +54,13 @@ func (mm *MessageManager) CreateAppendEntriesRequest(term, prevLogIndex, prevLog
 	}
 }
 
-func (mm *MessageManager) CreateRequestVoteRequest() *RequestVoteRequest {
-	return &RequestVoteRequest{}
+func (mm *MessageManager) CreateRequestVoteRequest(term, candidateId, lastLogIndex, lastLogTerm uint64) *RequestVoteRequest {
+	return &RequestVoteRequest{
+		Term:         term,
+		CandidateId:  candidateId,
+		LastLogIndex: lastLogIndex,
+		LastLogterm:  lastLogTerm,
+	}
 }
 
 func (mm *MessageManager) CreateAppendEntriesResponse(term uint64, success bool) *AppendEntriesResponse {
