@@ -11,15 +11,15 @@ type Payload interface {
 //RPC
 //AppendEntiesはハートビートにも使われる
 type AppendEntriesRequest struct {
-	Term     uint64 //リーダーのterm
+	Term     int    //リーダーのterm
 	LeaderId string //クライアントからリクエストをfollowerが受け取ったときleaderに流すため
 
 	//ログ追加の時のleaderとflowwerのindexを突き合わせるのに使う,ログがないとき-1が来るのでint64
-	PrevLogIndex uint64
-	PrevLogTerm  uint64
+	PrevLogIndex int
+	PrevLogTerm  int
 
-	Entries      []Log  //ハートビートの時は空
-	LeaderCommit uint64 //リーダーのcommitIndex
+	Entries      []Log //ハートビートの時は空
+	LeaderCommit int   //リーダーのcommitIndex
 }
 
 func (a *AppendEntriesRequest) Marshal() ([]byte, error) {
@@ -32,8 +32,8 @@ func (a *AppendEntriesRequest) Unmarshal(content []byte) error {
 }
 
 type AppendEntriesResponse struct {
-	Term    uint64 //currentTerm
-	Success bool   //付き合わせが成功したか否か
+	Term    int  //currentTerm
+	Success bool //付き合わせが成功したか否か
 }
 
 func (a *AppendEntriesResponse) Marshal() ([]byte, error) {
@@ -50,12 +50,12 @@ func (a *AppendEntriesResponse) Unmarshal(content []byte) error {
 // }
 
 type RequestVoteRequest struct {
-	Term        uint64 //候補者のterm
-	CandidateId uint64 //候補者のId
+	Term        int //候補者のterm
+	CandidateId int //候補者のId
 
 	//以下は投票の有効性検証のために必要
-	LastLogIndex uint64 //候補者の最後のlogのindex
-	LastLogterm  uint64 //候補者の最後のlogのterm
+	LastLogIndex int //候補者の最後のlogのindex
+	LastLogterm  int //候補者の最後のlogのterm
 }
 
 func (r *RequestVoteRequest) Marshal() ([]byte, error) {
@@ -68,7 +68,7 @@ func (r *RequestVoteRequest) Unmarshal(content []byte) error {
 }
 
 type RequestVoteResponse struct {
-	Term        uint64
+	Term        int
 	VoteGranted bool //候補者が票を得たか
 }
 

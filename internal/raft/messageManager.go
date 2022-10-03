@@ -9,6 +9,7 @@ const (
 	REQUEST_VOTE
 	APPEND_ENTRIES_RESPONSE
 	REQUEST_VOTE_RESPONSE
+	CLIENT_MESSAGE
 )
 
 type Message struct {
@@ -43,7 +44,7 @@ func (mm *MessageManager) Parse(content []byte) (Message, error) {
 	return msg, nil
 }
 
-func (mm *MessageManager) CreateAppendEntriesRequest(term, prevLogIndex, prevLogTerm, leaderCommit uint64, entries []Log, leaderId string) *AppendEntriesRequest {
+func (mm *MessageManager) CreateAppendEntriesRequest(term, prevLogIndex, prevLogTerm, leaderCommit int, entries []Log, leaderId string) *AppendEntriesRequest {
 	return &AppendEntriesRequest{
 		Term:         term,
 		LeaderId:     leaderId,
@@ -54,7 +55,7 @@ func (mm *MessageManager) CreateAppendEntriesRequest(term, prevLogIndex, prevLog
 	}
 }
 
-func (mm *MessageManager) CreateRequestVoteRequest(term, candidateId, lastLogIndex, lastLogTerm uint64) *RequestVoteRequest {
+func (mm *MessageManager) CreateRequestVoteRequest(term, candidateId, lastLogIndex, lastLogTerm int) *RequestVoteRequest {
 	return &RequestVoteRequest{
 		Term:         term,
 		CandidateId:  candidateId,
@@ -63,14 +64,14 @@ func (mm *MessageManager) CreateRequestVoteRequest(term, candidateId, lastLogInd
 	}
 }
 
-func (mm *MessageManager) CreateAppendEntriesResponse(term uint64, success bool) *AppendEntriesResponse {
+func (mm *MessageManager) CreateAppendEntriesResponse(term int, success bool) *AppendEntriesResponse {
 	return &AppendEntriesResponse{
 		Term:    term,
 		Success: success,
 	}
 }
 
-func (mm *MessageManager) CreateRequestVoteResponse(term uint64, voteGranted bool) *RequestVoteResponse {
+func (mm *MessageManager) CreateRequestVoteResponse(term int, voteGranted bool) *RequestVoteResponse {
 	return &RequestVoteResponse{
 		Term:        term,
 		VoteGranted: voteGranted,

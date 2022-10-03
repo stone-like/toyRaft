@@ -6,7 +6,7 @@ import (
 )
 
 type FSM interface {
-	Apply([]byte)
+	Apply([]byte) error
 }
 
 type KVStore struct {
