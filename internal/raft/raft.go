@@ -167,6 +167,7 @@ func (n *Transport) Accept() (net.Conn, error) {
 
 func (n *Transport) Close() error {
 	return n.Listener.Close()
+
 }
 
 type Node struct {
@@ -241,13 +242,10 @@ var defaultCreateElectionTime = func() time.Duration {
 
 //pingInterval<=とすること
 type Raft struct {
-	// appendCh     chan api.AppendEntriesRequest
-	requestCh chan *RaftMessage
-	// appendResCh  chan api.AppendEntriesResponse
-	requestResCh chan *RaftMessage
-	streamCh     chan net.Conn
-	shutdownCh   chan struct{}
-	stopCh       chan struct{}
+	requestCh  chan *RaftMessage
+	streamCh   chan net.Conn
+	shutdownCh chan struct{}
+	stopCh     chan struct{}
 
 	Transport      *Transport
 	msgTimeout     time.Duration
@@ -282,6 +280,8 @@ func (r *Raft) isCandidate() bool {
 	return r.currentStatus == Candidate
 }
 
+//TODO retry処理を作る、今はshutdownb済みのやつにも送ってしまう
+//retry回数失敗したらStatus=DeadにしてDeadのやつには送らないようにする？
 func (r *Raft) send(addr string, payload []byte) {
 	conn, err := r.Transport.Dial(addr, r.msgTimeout)
 	if err != nil {
@@ -426,6 +426,8 @@ func NewRaft(c *Config) (*Raft, error) {
 		logger:         c.logger,
 		streamCh:       make(chan net.Conn),
 		requestCh:      make(chan *RaftMessage),
+		shutdownCh:     make(chan struct{}),
+		stopCh:         make(chan struct{}),
 		messageManager: mm,
 
 		addr: c.serverAddr,
@@ -603,6 +605,9 @@ func (r *Raft) resetStateOnLeader() {
 }
 
 func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEntriesResponse) {
+
+	r.logger.Printf("%s get AppendEntryResponse from %s\n", r.addr, addr)
+
 	node, err := r.getNodeByAddr(addr)
 	if err != nil {
 		r.logger.Println(err)
@@ -619,7 +624,12 @@ func (r *Raft) handleLeaderAppendEntriesResponse(addr string, payload *AppendEnt
 		//なので次に送る予定の11(まだリーダーのログにはないかも)をnextIndex
 		//matchIndexは対象のfollowerに複製済みの最大indexなので、今回複製した最大の10が入る...でいいはず
 		r.state.nextIndexes[node] = uint64(len(r.state.logs))
-		r.state.matchIndexes[node] = uint64(len(r.state.logs) - 1)
+
+		if len(r.state.logs) == 0 {
+			r.state.matchIndexes[node] = 0
+		} else {
+			r.state.matchIndexes[node] = uint64(len(r.state.logs) - 1)
+		}
 		return
 	}
 
@@ -821,11 +831,7 @@ func timerReset(t *time.Timer, resetTime time.Duration) {
 	t.Reset(resetTime)
 }
 
-// func (r *Raft) handleHeartBeat(addr string, message *AppendEntriesRequest) {
-
-// }
-
-func (r *Raft) handleFollowerAppendEntries(addr string, payload *AppendEntriesRequest) {
+func (r *Raft) checkAECondition(addr string, payload *AppendEntriesRequest) bool {
 	checkLog := func() bool {
 		if payload.PrevLogIndex == 0 && payload.PrevLogTerm == 0 {
 			return false
@@ -852,16 +858,16 @@ func (r *Raft) handleFollowerAppendEntries(addr string, payload *AppendEntriesRe
 		return a
 	}
 
-	success := true
+	// success := true
 
 	//1.
 	if payload.Term < r.state.currentTerm {
-		success = false
+		return false
 	}
 
 	//2.
 	if !checkLog() {
-		success = false
+		return false
 	}
 
 	//3.indexがリーダーとフォロワーで同じで、termが違う場合、以降をすべて削除
@@ -875,10 +881,11 @@ func (r *Raft) handleFollowerAppendEntries(addr string, payload *AppendEntriesRe
 		}
 	}
 
+	//TODO ここのealryReturn部分ちょっと違いそうなので多分修正
 	//ここまででsuccess=falseだったらealryReturn?
-	if !success {
-		return
-	}
+	// if !success {
+	// 	return false
+	// }
 
 	//successがtrueの時のみ指定されたindex以降を複製、つまりpayload.entries
 	//4.まだエントリにないログだったら追加
@@ -888,6 +895,34 @@ func (r *Raft) handleFollowerAppendEntries(addr string, payload *AppendEntriesRe
 	if payload.LeaderCommit > r.state.commitIndex {
 		r.state.commitIndex = uint64(min(int(payload.LeaderCommit), len(r.state.logs)))
 	}
+
+	return true
+}
+
+func (r *Raft) handleRaftAppendEntries(addr string, payload *AppendEntriesRequest) {
+
+	success := r.checkAECondition(addr, payload)
+
+	resPayload := r.messageManager.CreateAppendEntriesResponse(
+		r.state.currentTerm,
+		success,
+	)
+	bytes, err := resPayload.Marshal()
+	if err != nil {
+		r.logger.Println(err)
+		return
+	}
+
+	msg, err := r.messageManager.Create(APPEND_ENTRIES_RESPONSE, r.addr, bytes)
+	if err != nil {
+		r.logger.Println(err)
+		return
+	}
+
+	r.logger.Printf("%s send AppendEntriesResponse to %s\n", r.addr, addr)
+
+	r.send(addr, msg)
+
 }
 
 //RPCを処理する前に必ず
@@ -901,7 +936,7 @@ func (r *Raft) handleFollowerMessage(message *RaftMessage) {
 	switch payload := message.payload.(type) {
 	case *AppendEntriesRequest:
 		r.commonProcessMessageOnAllStatus(payload.Term)
-		r.handleFollowerAppendEntries(message.addr, payload)
+		r.handleRaftAppendEntries(message.addr, payload)
 		return
 	case *RequestVoteRequest:
 		r.commonProcessMessageOnAllStatus(payload.Term)
@@ -991,15 +1026,15 @@ func (r *Raft) sendRequestVote() {
 
 //Candidateの場合LeaderにResponseって返すのか？
 //Requestが来たら多分返すで良い
-func (r *Raft) handleCandidateAppendEntries(message *AppendEntriesRequest) bool {
+// func (r *Raft) handleCandidateAppendEntries(message *AppendEntriesRequest) bool {
 
-	//☆ 新しいリーダーの時は自分がFollowerになる
-	if message.Term < r.state.currentTerm {
-		return false
-	}
+// 	//☆ 新しいリーダーの時は自分がFollowerになる
+// 	if message.Term < r.state.currentTerm {
+// 		return false
+// 	}
 
-	return true
-}
+// 	return true
+// }
 
 func (r *Raft) checkVoteGranted(payload *RequestVoteRequest) bool {
 	//1タームにつき一人の候補者にしか投票できない
@@ -1104,7 +1139,7 @@ func (r *Raft) handleCandidateMessage(message *RaftMessage) {
 	switch payload := message.payload.(type) {
 	case *AppendEntriesRequest:
 		r.commonProcessMessageOnAllStatus(payload.Term)
-		r.handleCandidateAppendEntries(payload)
+		r.handleRaftAppendEntries(message.addr, payload)
 		return
 	case *RequestVoteRequest:
 		r.commonProcessMessageOnAllStatus(payload.Term)
@@ -1174,7 +1209,11 @@ func (r *Raft) runCandidate() {
 }
 
 //raft本来の処理に関係ない奴はconnectionManegerに移した方が良さそう
-
+//Shutdownしてshutdownをclose,listernerもCloseすると、Acceptでuse of closed network connectionが出てしまう
+//回避する方法ある？
+//Acceptでuse of closed network connectionでてかつshutDown済みだったらエラー吐かないようにすればいいはず
+//shutDownChだけforの先頭に置く使い方ならchannelじゃなくatomicBooleanでいい気もする
+//他のselectの中に混ぜるならchannelのままでいいけど
 func (r *Raft) Serve() {
 	for {
 
@@ -1186,8 +1225,13 @@ func (r *Raft) Serve() {
 
 		conn, err := r.Transport.Accept()
 		if err != nil {
-			log.Fatal(err)
-			return
+			select {
+			case <-r.shutdownCh:
+				return
+			default:
+				log.Fatal(err)
+				return
+			}
 		}
 		r.streamCh <- conn
 	}
@@ -1289,9 +1333,18 @@ func (r *Raft) handleRequestVoteResponse(payload []byte, addr string) {
 }
 
 func (r *Raft) ShutDown() {
+
+	select {
+	case <-r.shutdownCh:
+		return
+	default:
+	}
+
 	close(r.shutdownCh)
 	err := r.Transport.Close()
 	if err != nil {
 		r.logger.Println(err)
 	}
+
+	r.logger.Printf("%s is Shutdown...\n", r.addr)
 }

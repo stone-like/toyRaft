@@ -9,27 +9,69 @@ import (
 
 //aeのテストを書く
 func TestElection(t *testing.T) {
-	servers := setupServers(t)
-	println(servers)
+	servers, cleanUp := setupServers(t)
+
+	defer func() {
+		cleanUp()
+	}()
+
 	require.Eventually(t, func() bool {
 		return servers[0].isLeader()
-	}, time.Second, 500*time.Millisecond,
+	}, time.Second, 300*time.Millisecond,
 	)
 
 	require.True(t, servers[0].isLeader())
 }
 
-// func getLeader(servers []*Raft) (*Raft, bool) {
+func TestKeepLeaderAndFollower(t *testing.T) {
+	servers, cleanUp := setupServers(t)
 
-// 	for _, server := range servers {
-// 		if server.isLeader() {
-// 			return server, true
-// 		}
-// 	}
-// 	return nil, false
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	time.Sleep(500 * time.Millisecond)
+	require.True(t, servers[0].isLeader())
+	require.True(t, servers[1].isFollower())
+	require.True(t, servers[2].isFollower())
+}
+
+//なんでこんなリーダー再選まで時間かかる？<-HeartBeatがやたら多くなってるためだと思う、そのためリクエストチャンネルが圧迫されて遅くなってる
+//HeartBeatのピンポンについて調べる
+//具体的にはログがないときのHeartBeatぴんぽん
+func TestLeaderChange(t *testing.T) {
+	servers, cleanUp := setupServers(t)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	servers[0].ShutDown()
+	require.Eventually(t, func() bool {
+		return servers[1].isLeader()
+	}, 7*time.Second, 300*time.Millisecond,
+	)
+	require.True(t, servers[1].isLeader())
+	require.True(t, servers[2].isFollower())
+}
+
+// func TestLogReplication(t *testing.T) {
+// 	servers := setupServers(t)
 // }
 
-func setupServers(t *testing.T) []*Raft {
+type CleanUp func()
+
+func setupServers(t *testing.T) ([]*Raft, CleanUp) {
 	t.Helper()
 	configs := MakeConfig()
 	var servers []*Raft
@@ -39,7 +81,19 @@ func setupServers(t *testing.T) []*Raft {
 		servers = append(servers, server)
 	}
 
-	return servers
+	cleanUp := func() {
+		for _, server := range servers {
+
+			select {
+			case <-server.shutdownCh:
+				continue
+			default:
+				server.ShutDown()
+			}
+		}
+	}
+
+	return servers, cleanUp
 }
 
 func Copy(s []Server) []Server {
