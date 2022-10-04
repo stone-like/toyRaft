@@ -142,22 +142,22 @@ func makeStatesForFigure7() []*state {
 		term: 8,
 	}
 
-	// //(b)
-	// state2 := &state{
-	// 	log: []Log{
-	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4},
-	// 	},
-	// 	term: 4,
-	// }
-	// //(d)
-	// state3 := &state{
-	// 	log: []Log{
-	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
-	// 		{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
-	// 		{Term: 7}, {Term: 7},
-	// 	},
-	// 	term: 7,
-	// }
+	//(b)
+	state2 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4},
+		},
+		term: 4,
+	}
+	//(d)
+	state3 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
+			{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
+			{Term: 7}, {Term: 7},
+		},
+		term: 7,
+	}
 	state4 := &state{
 		log: []Log{
 			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 2}, {Term: 2},
@@ -168,41 +168,50 @@ func makeStatesForFigure7() []*state {
 	}
 
 	return []*state{
-		// state1, state2, state3, state4,
-		state1, state4,
+		state1, state2, state3, state4,
 	}
+}
+
+func checkTwoLogEqual(log1, log2 []Log) bool {
+	if len(log1) != len(log2) {
+		return false
+	}
+
+	for index, _ := range log1 {
+		if log1[index].Term != log2[index].Term || string(log1[index].Content) != string(log2[index].Content) {
+			return false
+		}
+	}
+
+	return true
 }
 func TestLogReplicationForFigure7b(t *testing.T) {
 
-	servers, _, cleanUp, err := setupServers(t, 2, makeStatesForFigure7())
+	servers, _, cleanUp, err := setupServers(t, 4, makeStatesForFigure7())
 	require.NoError(t, err)
 
 	defer func() {
 		cleanUp()
 	}()
 
-	// condition := func() bool {
-	// 	targetLog := []Log{
-	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
-	// 		{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
-	// 	}
-	// 	server2Ok := reflect.DeepEqual(targetLog, servers[1].state.logs)
-	// 	server3Ok := reflect.DeepEqual(targetLog, servers[2].state.logs)
-	// 	server4Ok := reflect.DeepEqual(targetLog, servers[3].state.logs)
+	condition := func() bool {
+		targetLog := []Log{
+			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
+			{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
+		}
+		server2Ok := checkTwoLogEqual(targetLog, servers[1].state.logs)
+		server3Ok := checkTwoLogEqual(targetLog, servers[2].state.logs)
+		server4Ok := checkTwoLogEqual(targetLog, servers[3].state.logs)
 
-	// 	return server2Ok && server3Ok && server4Ok
-	// }
+		return server2Ok && server3Ok && server4Ok
+	}
 
 	require.Eventually(t, func() bool {
 		return servers[0].isLeader()
 	}, time.Second, 300*time.Millisecond,
 	)
 
-	time.Sleep(10 * time.Second)
-
-	fmt.Println("aaaa")
-
-	// require.Eventually(t, condition, 5*time.Second, 300*time.Millisecond)
+	require.Eventually(t, condition, 10*time.Second, 300*time.Millisecond)
 
 }
 
