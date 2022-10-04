@@ -2,7 +2,9 @@ package raft
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"testing"
@@ -12,9 +14,14 @@ import (
 	"github.com/travisjeffery/go-dynaport"
 )
 
+var (
+	ErrNotMatchServerNumAndLogs = errors.New("NotMatchServerNumAndLogsError")
+)
+
 //aeのテストを書く
 func TestElection(t *testing.T) {
-	servers, _, cleanUp := setupServers(t)
+	servers, _, cleanUp, err := setupServers(t, 3, nil)
+	require.NoError(t, err)
 
 	defer func() {
 		cleanUp()
@@ -29,7 +36,8 @@ func TestElection(t *testing.T) {
 }
 
 func TestKeepLeaderAndFollower(t *testing.T) {
-	servers, _, cleanUp := setupServers(t)
+	servers, _, cleanUp, err := setupServers(t, 3, nil)
+	require.NoError(t, err)
 
 	defer func() {
 		cleanUp()
@@ -47,7 +55,8 @@ func TestKeepLeaderAndFollower(t *testing.T) {
 }
 
 func TestLeaderChange(t *testing.T) {
-	servers, _, cleanUp := setupServers(t)
+	servers, _, cleanUp, err := setupServers(t, 3, nil)
+	require.NoError(t, err)
 
 	defer func() {
 		cleanUp()
@@ -68,7 +77,8 @@ func TestLeaderChange(t *testing.T) {
 }
 
 func TestLogReplication(t *testing.T) {
-	servers, fsms, cleanUp := setupServers(t)
+	servers, fsms, cleanUp, err := setupServers(t, 3, nil)
+	require.NoError(t, err)
 
 	defer func() {
 		cleanUp()
@@ -116,6 +126,86 @@ func TestLogReplication(t *testing.T) {
 
 }
 
+//論文中のfigure7より
+//figure7-b(エントリ欠落)
+//figure7-d(余分エントリ)
+//figure7-f(エントリ不足and余分エントリ)
+//を用いる。
+
+func makeStatesForFigure7() []*state {
+	//(leader)
+	state1 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
+			{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
+		},
+		term: 8,
+	}
+
+	// //(b)
+	// state2 := &state{
+	// 	log: []Log{
+	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4},
+	// 	},
+	// 	term: 4,
+	// }
+	// //(d)
+	// state3 := &state{
+	// 	log: []Log{
+	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
+	// 		{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
+	// 		{Term: 7}, {Term: 7},
+	// 	},
+	// 	term: 7,
+	// }
+	state4 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 1}, {Term: 1}, {Term: 2}, {Term: 2},
+			{Term: 2}, {Term: 3}, {Term: 3}, {Term: 3}, {Term: 3},
+			{Term: 3},
+		},
+		term: 3,
+	}
+
+	return []*state{
+		// state1, state2, state3, state4,
+		state1, state4,
+	}
+}
+func TestLogReplicationForFigure7b(t *testing.T) {
+
+	servers, _, cleanUp, err := setupServers(t, 2, makeStatesForFigure7())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	// condition := func() bool {
+	// 	targetLog := []Log{
+	// 		{Term: 1}, {Term: 1}, {Term: 1}, {Term: 4}, {Term: 4},
+	// 		{Term: 5}, {Term: 5}, {Term: 6}, {Term: 6}, {Term: 6},
+	// 	}
+	// 	server2Ok := reflect.DeepEqual(targetLog, servers[1].state.logs)
+	// 	server3Ok := reflect.DeepEqual(targetLog, servers[2].state.logs)
+	// 	server4Ok := reflect.DeepEqual(targetLog, servers[3].state.logs)
+
+	// 	return server2Ok && server3Ok && server4Ok
+	// }
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	time.Sleep(10 * time.Second)
+
+	fmt.Println("aaaa")
+
+	// require.Eventually(t, condition, 5*time.Second, 300*time.Millisecond)
+
+}
+
 func checkNextIndexForNode(server *Raft, nodeAddr string, nodeId int, index int) bool {
 	node := Node{Addr: nodeAddr, ServerId: nodeId}
 	nextIndex := server.state.nextIndexes[node]
@@ -157,9 +247,14 @@ func sendClientMessage(t *testing.T, server *Raft) {
 
 type CleanUp func()
 
-func setupServers(t *testing.T) ([]*Raft, []FakeFSM, CleanUp) {
+func setupServers(t *testing.T, serverNum int, initialStates []*state) ([]*Raft, []FakeFSM, CleanUp, error) {
 	t.Helper()
-	configs := MakeConfig()
+	configs, err := MakeConfig(serverNum, initialStates)
+
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
 	var servers []*Raft
 	var FSMs []FakeFSM
 	for _, config := range configs {
@@ -184,7 +279,7 @@ func setupServers(t *testing.T) ([]*Raft, []FakeFSM, CleanUp) {
 		}
 	}
 
-	return servers, FSMs, cleanUp
+	return servers, FSMs, cleanUp, nil
 }
 
 func Copy(s []Server) []Server {
@@ -200,6 +295,16 @@ func Copy(s []Server) []Server {
 type Server struct {
 	addr                 string
 	generateElectionTime func() time.Duration
+}
+
+type state struct {
+	term int
+	log  []Log
+}
+
+func (s *state) setStateToConfig(c *Config) {
+	c.initialLog = s.log
+	c.initialTerm = s.term
 }
 
 type Faker struct {
@@ -221,16 +326,28 @@ type FakeFSM struct {
 	ServerId int
 }
 
-func MakeConfig() []*Config {
-
-	makePorts := func() []int {
-		return dynaport.Get(3)
+func MakeConfig(serverNum int, initialStates []*state) ([]*Config, error) {
+	if len(initialStates) != 0 && serverNum != len(initialStates) {
+		return nil, ErrNotMatchServerNumAndLogs
 	}
 
-	funcs := []func() time.Duration{
-		func() time.Duration { return 150 * time.Millisecond },
-		func() time.Duration { return 220 * time.Millisecond },
-		func() time.Duration { return 300 * time.Millisecond },
+	makePorts := func() []int {
+		return dynaport.Get(serverNum)
+	}
+
+	maxElection := 300
+	minElection := 180
+
+	makeFns := func() []func() time.Duration {
+		var fns []func() time.Duration
+
+		fns = append(fns, func() time.Duration { return 150 * time.Millisecond })
+		for i := 1; i < serverNum; i++ {
+			num := rand.Intn(maxElection-minElection) + minElection
+			fns = append(fns, func() time.Duration { return time.Duration(num) * time.Millisecond })
+		}
+
+		return fns
 	}
 
 	makeServers := func(ports []int, fns []func() time.Duration) []Server {
@@ -245,7 +362,7 @@ func MakeConfig() []*Config {
 		return servers
 	}
 
-	servers := makeServers(makePorts(), funcs)
+	servers := makeServers(makePorts(), makeFns())
 
 	var configs []*Config
 
@@ -258,14 +375,19 @@ func MakeConfig() []*Config {
 		for _, peer := range peers {
 			peerAddrs = append(peerAddrs, peer.addr)
 		}
+
 		config := &Config{
 			serverAddr:             server.addr,
 			peerAddrs:              peerAddrs,
 			generateElectionTimeFn: server.generateElectionTime,
 		}
+
+		if len(initialStates) != 0 {
+			initialStates[i].setStateToConfig(config)
+		}
 		configs = append(configs, config)
 	}
 
-	return configs
+	return configs, nil
 
 }

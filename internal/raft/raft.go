@@ -322,6 +322,8 @@ func (r *Raft) receive(conn net.Conn) ([]byte, error) {
 
 }
 
+//後々snapshotだったりrestoreの時に実装する予定だけど、
+//今はとりあえずtestで使うようにconfigにinitialLog,initialTermを実装
 type Config struct {
 	serverAddr             string //include port
 	msgTimeout             time.Duration
@@ -330,6 +332,9 @@ type Config struct {
 	peerAddrs              []string
 	fsm                    FSM
 	generateElectionTimeFn func() time.Duration
+
+	initialLog  []Log
+	initialTerm int
 }
 
 //TODO のちのちNodeManagerとして分割
@@ -456,6 +461,14 @@ func NewRaft(c *Config) (*Raft, error) {
 		serverId:             serverId,
 	}
 
+	if len(c.initialLog) != 0 {
+		r.state.logs = c.initialLog
+	}
+
+	if c.initialTerm != 0 {
+		r.state.currentTerm = c.initialTerm
+	}
+
 	//最初はFollwerから起動する
 	r.currentStatus = Follower
 	r.state.votedFor = -1
@@ -500,7 +513,6 @@ func (r *Raft) runState() {
 	}
 }
 
-//TODO prevLogとprevLogTerm,の扱い,ここもやる
 func (r *Raft) HeartBeat() {
 
 	r.mu.Lock()
@@ -983,6 +995,9 @@ func (r *Raft) checkAECondition(addr string, payload *AppendEntriesRequest) bool
 	}
 
 	isLogConflict := func(followerIndex, leaderIndex, followerTerm, leaderTerm int) bool {
+		if followerIndex > leaderIndex {
+			return true
+		}
 		return followerIndex == leaderIndex && followerTerm != leaderTerm
 	}
 
@@ -1017,13 +1032,6 @@ func (r *Raft) checkAECondition(addr string, payload *AppendEntriesRequest) bool
 		}
 	}
 
-	//TODO ここのealryReturn部分ちょっと違いそうなので多分修正
-	//ここまででsuccess=falseだったらealryReturn?
-	// if !success {
-	// 	return false
-	// }
-
-	//successがtrueの時のみ指定されたindex以降を複製、つまりpayload.entries
 	//4.まだエントリにないログだったら追加
 
 	if len(payload.Entries) != 0 {
@@ -1242,7 +1250,7 @@ func (r *Raft) handleRaftRequestVote(addr string, payload *RequestVoteRequest) {
 	r.send(addr, msg)
 }
 
-//☆　過半数獲得でリーダー
+//過半数獲得でリーダー
 func (r *Raft) shouldLeader() bool {
 
 	r.mu.Lock()
