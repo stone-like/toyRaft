@@ -18,7 +18,8 @@ var (
 	ErrNotMatchServerNumAndLogs = errors.New("NotMatchServerNumAndLogsError")
 )
 
-//aeのテストを書く
+//改善点
+//本当にeventuallyをつかったテスト形式でいいのか
 func TestElection(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
@@ -69,11 +70,9 @@ func TestLeaderChange(t *testing.T) {
 
 	servers[0].ShutDown()
 	require.Eventually(t, func() bool {
-		return servers[1].isLeader()
+		return servers[1].isLeader() || servers[2].isLeader()
 	}, 7*time.Second, 300*time.Millisecond,
 	)
-	require.True(t, servers[1].isLeader())
-	require.True(t, servers[2].isFollower())
 }
 
 func TestLogReplication(t *testing.T) {
@@ -185,7 +184,7 @@ func checkTwoLogEqual(log1, log2 []Log) bool {
 
 	return true
 }
-func TestLogReplicationForFigure7b(t *testing.T) {
+func TestLogReplicationForFigure7(t *testing.T) {
 
 	servers, _, cleanUp, err := setupServers(t, 4, makeStatesForFigure7())
 	require.NoError(t, err)
@@ -213,6 +212,180 @@ func TestLogReplicationForFigure7b(t *testing.T) {
 
 	require.Eventually(t, condition, 10*time.Second, 300*time.Millisecond)
 
+}
+
+func makeStatesForFigure8() []*state {
+	//(leader)
+	state1 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2}, {Term: 4},
+		},
+		term:             4,
+		commitIndex:      0,
+		hasInitialCommit: true,
+	}
+
+	//(b)
+	state2 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2},
+		},
+		term: 2,
+	}
+	//(d)
+	state3 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2},
+		},
+		term: 2,
+	}
+	state4 := &state{
+		log: []Log{
+			{Term: 1},
+		},
+		term: 1,
+	}
+	state5 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 3},
+		},
+		term: 3,
+	}
+
+	return []*state{
+		state1, state2, state3, state4, state5,
+	}
+}
+
+//自分のtermでcommitできるlogが発生した場合のみ、そのlogより前の未commitLogもcommit
+func TestUnCommittableCase(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 5, makeStatesForFigure8())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	time.Sleep(5 * time.Second)
+	//leaderになったときにはterm5になっていて、term5未満のログしか持ってないからcommitできない
+	require.True(t, servers[0].state.commitIndex == 0)
+
+}
+
+func TestCommittableCase(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 5, makeStatesForFigure8())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	sendClientMessage(t, servers[0])
+
+	require.Eventually(t, func() bool {
+		return servers[0].state.commitIndex == 3
+	}, 5*time.Second, 300*time.Millisecond,
+	)
+}
+
+func makeStatesForLeaderOnTerm() []*state {
+	state1 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2}, {Term: 3},
+		},
+	}
+
+	state2 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 4},
+		},
+	}
+	state3 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 4},
+		},
+	}
+
+	return []*state{
+		state1, state2, state3,
+	}
+}
+
+//server1
+//[{term1},{term2},{term3}]
+//server2
+//[{term1},{term4}]
+//server3
+//[{term1},{term4}]
+//上記でserver2か3がleaderになる
+//electioTimeoutをserver1が一番早いようにしてあるので普通ななら1がリーダーとなるはず
+//ただログの条件的に2か3がリーダーとなる
+func TestCanBeLeaderOnTerm(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 3, makeStatesForLeaderOnTerm())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[1].isLeader() || servers[2].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+}
+
+func makeStatesForLeaderOnTermAndIndex() []*state {
+	state1 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2}, {Term: 3},
+		},
+	}
+
+	state2 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2}, {Term: 3}, {Term: 3},
+		},
+	}
+	state3 := &state{
+		log: []Log{
+			{Term: 1}, {Term: 2}, {Term: 3}, {Term: 3},
+		},
+	}
+
+	return []*state{
+		state1, state2, state3,
+	}
+}
+
+//server1
+//[{term1},{term2},{term3}]
+//server2
+//[{term1},{term2},{term3},{term3}]
+//server3
+//[{term1},{term2},{term3},{term3}]
+//上記でserver2か3がleaderになる
+func TestCanBeLeaderOnTermAndIndex(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 3, makeStatesForLeaderOnTermAndIndex())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[1].isLeader() || servers[2].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
 }
 
 func checkNextIndexForNode(server *Raft, nodeAddr string, nodeId int, index int) bool {
@@ -307,13 +480,17 @@ type Server struct {
 }
 
 type state struct {
-	term int
-	log  []Log
+	term             int
+	commitIndex      int
+	log              []Log
+	hasInitialCommit bool
 }
 
 func (s *state) setStateToConfig(c *Config) {
 	c.initialLog = s.log
 	c.initialTerm = s.term
+	c.initialCommitIndex = s.commitIndex
+	c.hasInitialCommit = s.hasInitialCommit
 }
 
 type Faker struct {

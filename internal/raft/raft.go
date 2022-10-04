@@ -323,7 +323,7 @@ func (r *Raft) receive(conn net.Conn) ([]byte, error) {
 }
 
 //後々snapshotだったりrestoreの時に実装する予定だけど、
-//今はとりあえずtestで使うようにconfigにinitialLog,initialTermを実装
+//今はとりあえずtestで使うようにconfigにinitialLog,initialTerm,initialCommitIndexを実装
 type Config struct {
 	serverAddr             string //include port
 	msgTimeout             time.Duration
@@ -333,8 +333,10 @@ type Config struct {
 	fsm                    FSM
 	generateElectionTimeFn func() time.Duration
 
-	initialLog  []Log
-	initialTerm int
+	initialLog         []Log
+	initialTerm        int
+	initialCommitIndex int
+	hasInitialCommit   bool
 }
 
 //TODO のちのちNodeManagerとして分割
@@ -461,6 +463,12 @@ func NewRaft(c *Config) (*Raft, error) {
 		serverId:             serverId,
 	}
 
+	//最初はFollwerから起動する
+	r.currentStatus = Follower
+	r.state.votedFor = -1
+	r.state.commitIndex = -1
+	r.state.lastApplied = -1
+
 	if len(c.initialLog) != 0 {
 		r.state.logs = c.initialLog
 	}
@@ -469,11 +477,9 @@ func NewRaft(c *Config) (*Raft, error) {
 		r.state.currentTerm = c.initialTerm
 	}
 
-	//最初はFollwerから起動する
-	r.currentStatus = Follower
-	r.state.votedFor = -1
-	r.state.commitIndex = -1
-	r.state.lastApplied = -1
+	if c.hasInitialCommit {
+		r.state.commitIndex = c.initialCommitIndex
+	}
 
 	r.Run()
 
@@ -879,50 +885,8 @@ func (r *Raft) checkLastApplied() {
 	}
 }
 
-// func (r *Raft) checkAppendEntries() {
-
-// 	r.mu.Lock()
-// 	defer r.mu.Unlock()
-
-// 	for _, node := range r.nodes {
-
-// 		if node.Addr == r.addr {
-// 			continue
-// 		}
-
-// 		latestLeaderIndex := r.state.getLatestIndex()
-// 		nodeNextIndex := r.state.nextIndexes[node]
-// 		if nodeNextIndex <= latestLeaderIndex {
-// 			prevIndex, prevTerm := r.getPrevIndexAndTerm(nodeNextIndex)
-
-// 			entries := r.state.getSendableLogs(nodeNextIndex)
-
-// 			aePayload := r.messageManager.CreateAppendEntriesRequest(
-// 				r.state.currentTerm,
-// 				prevIndex,
-// 				prevTerm,
-// 				r.state.commitIndex,
-// 				entries,
-// 				r.addr,
-// 			)
-// 			bytes, err := aePayload.Marshal()
-// 			if err != nil {
-// 				r.logger.Println(err)
-// 				return
-// 			}
-
-// 			msg, err := r.messageManager.Create(APPEND_ENTRIES, r.addr, bytes)
-// 			if err != nil {
-// 				r.logger.Println(err)
-// 				return
-// 			}
-
-// 			r.logger.Printf("%s send AppendEntries to %s:  prevIndex:%d,prevTerm:%d,nextIndex:%d,entriesLen:%d\n", r.GetServerName(), node.Addr, prevIndex, prevTerm, nodeNextIndex, len(entries))
-// 			go r.send(node.Addr, msg)
-// 		}
-// 	}
-// }
-
+//commitタイミングに関して、Leader遷移時にNO-OPログを自動作成という方法もあるが、
+//現在はclientからのメッセージのみとしている
 func (r *Raft) runLeader() {
 
 	r.logger.Printf("%s Go To Leader\n", r.addr)
@@ -1206,7 +1170,7 @@ func (r *Raft) checkVoteGranted(payload *RequestVoteRequest) bool {
 	// end with the same term, then whichever log is longer is
 	// more up-to-date.
 	isLogLatest := func() bool {
-		//自分の側にログがなくて相手の側にログあるときは相手の方が最新でいいはず
+		//自分の側に一つもログがなくて相手の側にログあるときは相手の方が最新でいいはず
 		latestLog, logExists := r.state.getLatest()
 		if !logExists {
 			return true
