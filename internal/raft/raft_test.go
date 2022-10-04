@@ -19,7 +19,10 @@ var (
 )
 
 //改善点
-//本当にeventuallyをつかったテスト形式でいいのか
+//本当にeventuallyを使ったテスト形式、最初にログを与えてのテスト形式でいいのか
+//最初にログを与える方法だとインテグレーションテストとは行かないのでやっぱり、クライアント経由でログを与えてしっかり動くかのテストまでやりたい
+//ただちょっと実現方法が難しそう...
+//例えばraftServerを一時的にスリープさせて、狙ったサーバーだけ動かすみたいな感じ？
 func TestElection(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
