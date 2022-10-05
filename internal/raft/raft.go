@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+//TODO
+//一度しか使わない関数をこまごま分けすぎ、関数が増えてしまって見づらい
+
 var (
 	ErrUnknownMessage   = errors.New("UnknownMessageError")
 	ErrInvalidMessage   = errors.New("InvalidMessageError")
@@ -262,6 +265,7 @@ type Raft struct {
 
 	votedInfo            *VotedInfo
 	fsm                  FSM
+	storage              Storage
 	generateElectionTime func() time.Duration
 }
 
@@ -322,6 +326,19 @@ func (r *Raft) receive(conn net.Conn) ([]byte, error) {
 
 }
 
+//persistが呼ばれるのはRPCResponse時のみ
+//各Statusのhandle~MessageでLockをかけているのでここでのLockは必要なし
+func (r *Raft) persistToStorage() {
+	r.storage.Persist(r.state.currentTerm, r.state.votedFor, r.state.logs)
+}
+
+func (r *Raft) recoverFromStorage() {
+	currentTerm, votedFor, logs := r.storage.Restore()
+	r.state.currentTerm = currentTerm
+	r.state.votedFor = votedFor
+	r.state.logs = logs
+}
+
 //後々snapshotだったりrestoreの時に実装する予定だけど、
 //今はとりあえずtestで使うようにconfigにinitialLog,initialTerm,initialCommitIndexを実装
 type Config struct {
@@ -331,12 +348,8 @@ type Config struct {
 	logger                 *log.Logger
 	peerAddrs              []string
 	fsm                    FSM
+	storage                Storage
 	generateElectionTimeFn func() time.Duration
-
-	initialLog         []Log
-	initialTerm        int
-	initialCommitIndex int
-	hasInitialCommit   bool
 }
 
 //TODO のちのちNodeManagerとして分割
@@ -403,8 +416,7 @@ func extractServerId(addr string, nodes []Node) int {
 	return -1
 }
 
-//MessageManagerだったりTransportだったりraftと直接関係ないところは後々interfaceにした方が良さそう
-func NewRaft(c *Config) (*Raft, error) {
+func CreateInstance(c *Config) (*Raft, error) {
 	rand.Seed(time.Now().UnixNano())
 
 	ln, err := net.Listen("tcp", c.serverAddr)
@@ -457,6 +469,7 @@ func NewRaft(c *Config) (*Raft, error) {
 		state: state,
 
 		fsm:                  c.fsm,
+		storage:              c.storage,
 		votedInfo:            voteInfo,
 		nodes:                nodes,
 		generateElectionTime: c.generateElectionTimeFn,
@@ -469,16 +482,19 @@ func NewRaft(c *Config) (*Raft, error) {
 	r.state.commitIndex = -1
 	r.state.lastApplied = -1
 
-	if len(c.initialLog) != 0 {
-		r.state.logs = c.initialLog
+	//Restore
+	if r.storage.ShouldRestore() {
+		r.recoverFromStorage()
 	}
 
-	if c.initialTerm != 0 {
-		r.state.currentTerm = c.initialTerm
-	}
+	return r, nil
+}
 
-	if c.hasInitialCommit {
-		r.state.commitIndex = c.initialCommitIndex
+//MessageManagerだったりTransportだったりraftと直接関係ないところは後々interfaceにした方が良さそう
+func NewRaft(c *Config) (*Raft, error) {
+	r, err := CreateInstance(c)
+	if err != nil {
+		return nil, err
 	}
 
 	r.Run()
@@ -1030,6 +1046,9 @@ func (r *Raft) handleRaftAppendEntries(addr string, payload *AppendEntriesReques
 		return
 	}
 
+	//返信前にpersist
+	r.persistToStorage()
+
 	r.logger.Printf("%s send AppendEntriesResponse to %s\n", r.GetServerName(), addr)
 
 	r.send(addr, msg)
@@ -1208,6 +1227,9 @@ func (r *Raft) handleRaftRequestVote(addr string, payload *RequestVoteRequest) {
 		r.logger.Println(err)
 		return
 	}
+
+	//返信前にpersist
+	r.persistToStorage()
 
 	//候補者へ返信
 	r.logger.Printf("%s get RequestVoteRequest: from: %s\n", r.GetServerName(), addr)

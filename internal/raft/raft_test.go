@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/rand"
 	"net"
 	"sync"
@@ -26,6 +27,7 @@ var (
 func TestElection(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -42,6 +44,7 @@ func TestElection(t *testing.T) {
 func TestKeepLeaderAndFollower(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -61,6 +64,7 @@ func TestKeepLeaderAndFollower(t *testing.T) {
 func TestLeaderChange(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -81,6 +85,7 @@ func TestLeaderChange(t *testing.T) {
 func TestLogReplication(t *testing.T) {
 	servers, fsms, cleanUp, err := setupServers(t, 3, nil)
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -191,6 +196,7 @@ func TestLogReplicationForFigure7(t *testing.T) {
 
 	servers, _, cleanUp, err := setupServers(t, 4, makeStatesForFigure7())
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -264,6 +270,7 @@ func makeStatesForFigure8() []*state {
 func TestUnCommittableCase(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 5, makeStatesForFigure8())
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -283,6 +290,7 @@ func TestUnCommittableCase(t *testing.T) {
 func TestCommittableCase(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 5, makeStatesForFigure8())
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -336,6 +344,7 @@ func makeStatesForLeaderOnTerm() []*state {
 func TestCanBeLeaderOnTerm(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, makeStatesForLeaderOnTerm())
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -380,6 +389,7 @@ func makeStatesForLeaderOnTermAndIndex() []*state {
 func TestCanBeLeaderOnTermAndIndex(t *testing.T) {
 	servers, _, cleanUp, err := setupServers(t, 3, makeStatesForLeaderOnTermAndIndex())
 	require.NoError(t, err)
+	runServers(servers)
 
 	defer func() {
 		cleanUp()
@@ -389,6 +399,73 @@ func TestCanBeLeaderOnTermAndIndex(t *testing.T) {
 		return servers[1].isLeader() || servers[2].isLeader()
 	}, time.Second, 300*time.Millisecond,
 	)
+}
+
+func TestPersist(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 3, nil)
+	require.NoError(t, err)
+	runServers(servers)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	require.Eventually(t, func() bool {
+		return servers[0].isLeader()
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	sendClientMessage(t, servers[0])
+
+	//commitIndexが更新されているなら、followerはログ追加して、一回はAppendEntriesに返信してpersistしているはず
+	require.Eventually(t, func() bool {
+		return servers[1].state.commitIndex == 0
+	}, time.Second, 300*time.Millisecond,
+	)
+
+	wantLogs := Logs{
+		{Term: 1, Content: []byte("hello world")},
+	}
+	gotCurrentTerm, gotVotedFor, gotLogs := servers[1].storage.(*FakeStorage).Restore()
+	require.Equal(t, 1, gotCurrentTerm)
+	require.Equal(t, 0, gotVotedFor)
+	require.True(t, checkTwoLogEqual(wantLogs, gotLogs))
+}
+
+func makeStatesForRecover() []*state {
+	state1 := &state{
+		storage: &FakeStorage{
+			Info: Info{
+				CurrentTerm: 999,
+				VotedFor:    999,
+				Logs: Logs{
+					{Term: 1}, {Term: 2}, {Term: 3}},
+			},
+		},
+	}
+
+	state2 := &state{}
+	state3 := &state{}
+
+	return []*state{
+		state1, state2, state3,
+	}
+}
+
+func TestRecover(t *testing.T) {
+	servers, _, cleanUp, err := setupServers(t, 3, makeStatesForRecover())
+	require.NoError(t, err)
+
+	defer func() {
+		cleanUp()
+	}()
+
+	wantCurrentTerm, wantVotedFor, wantLogs := 999, 999, Logs{{Term: 1}, {Term: 2}, {Term: 3}}
+	gotCurrentTerm, gotVotedFor, gotLogs := servers[0].state.currentTerm, servers[0].state.votedFor, servers[0].state.logs
+
+	require.Equal(t, wantCurrentTerm, gotCurrentTerm)
+	require.Equal(t, wantVotedFor, gotVotedFor)
+	require.True(t, checkTwoLogEqual(wantLogs, gotLogs))
 }
 
 func checkNextIndexForNode(server *Raft, nodeAddr string, nodeId int, index int) bool {
@@ -432,6 +509,12 @@ func sendClientMessage(t *testing.T, server *Raft) {
 
 type CleanUp func()
 
+func runServers(servers []*Raft) {
+	for _, server := range servers {
+		go server.Run()
+	}
+}
+
 func setupServers(t *testing.T, serverNum int, initialStates []*state) ([]*Raft, []FakeFSM, CleanUp, error) {
 	t.Helper()
 	configs, err := MakeConfig(serverNum, initialStates)
@@ -445,8 +528,20 @@ func setupServers(t *testing.T, serverNum int, initialStates []*state) ([]*Raft,
 	for _, config := range configs {
 		fsm := &Faker{}
 		config.fsm = fsm
-		server, err := NewRaft(config)
+		server, err := CreateInstance(config.GetRaftConfig())
 		require.NoError(t, err)
+
+		if len(config.initialLog) != 0 {
+			server.state.logs = config.initialLog
+		}
+
+		if config.initialTerm != 0 {
+			server.state.currentTerm = config.initialTerm
+		}
+
+		if config.hasInitialCommit {
+			server.state.commitIndex = config.initialCommitIndex
+		}
 
 		servers = append(servers, server)
 		FSMs = append(FSMs, FakeFSM{store: fsm, ServerId: server.serverId})
@@ -487,13 +582,44 @@ type state struct {
 	commitIndex      int
 	log              []Log
 	hasInitialCommit bool
+	storage          Storage
 }
 
-func (s *state) setStateToConfig(c *Config) {
+type TestConfig struct {
+	serverAddr             string //include port
+	msgTimeout             time.Duration
+	pingInterval           time.Duration
+	logger                 *log.Logger
+	peerAddrs              []string
+	fsm                    FSM
+	generateElectionTimeFn func() time.Duration
+	storage                Storage
+
+	initialLog         []Log
+	initialTerm        int
+	initialCommitIndex int
+	hasInitialCommit   bool
+}
+
+func (t *TestConfig) GetRaftConfig() *Config {
+	return &Config{
+		serverAddr:             t.serverAddr,
+		msgTimeout:             t.msgTimeout,
+		pingInterval:           t.pingInterval,
+		logger:                 t.logger,
+		peerAddrs:              t.peerAddrs,
+		fsm:                    t.fsm,
+		storage:                t.storage,
+		generateElectionTimeFn: t.generateElectionTimeFn,
+	}
+}
+
+func (s *state) setStateToConfig(c *TestConfig) {
 	c.initialLog = s.log
 	c.initialTerm = s.term
 	c.initialCommitIndex = s.commitIndex
 	c.hasInitialCommit = s.hasInitialCommit
+	c.storage = s.storage
 }
 
 type Faker struct {
@@ -515,7 +641,7 @@ type FakeFSM struct {
 	ServerId int
 }
 
-func MakeConfig(serverNum int, initialStates []*state) ([]*Config, error) {
+func MakeConfig(serverNum int, initialStates []*state) ([]*TestConfig, error) {
 	if len(initialStates) != 0 && serverNum != len(initialStates) {
 		return nil, ErrNotMatchServerNumAndLogs
 	}
@@ -553,7 +679,7 @@ func MakeConfig(serverNum int, initialStates []*state) ([]*Config, error) {
 
 	servers := makeServers(makePorts(), makeFns())
 
-	var configs []*Config
+	var configs []*TestConfig
 
 	for i, server := range servers {
 
@@ -565,7 +691,7 @@ func MakeConfig(serverNum int, initialStates []*state) ([]*Config, error) {
 			peerAddrs = append(peerAddrs, peer.addr)
 		}
 
-		config := &Config{
+		config := &TestConfig{
 			serverAddr:             server.addr,
 			peerAddrs:              peerAddrs,
 			generateElectionTimeFn: server.generateElectionTime,
@@ -574,6 +700,11 @@ func MakeConfig(serverNum int, initialStates []*state) ([]*Config, error) {
 		if len(initialStates) != 0 {
 			initialStates[i].setStateToConfig(config)
 		}
+
+		if config.storage == nil {
+			config.storage = &FakeStorage{}
+		}
+
 		configs = append(configs, config)
 	}
 

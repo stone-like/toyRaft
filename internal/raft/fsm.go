@@ -9,6 +9,8 @@ type FSM interface {
 	Apply([]byte) error
 }
 
+var _ FSM = (*KVStore)(nil)
+
 type KVStore struct {
 	store map[string]string
 	mu    sync.Mutex
